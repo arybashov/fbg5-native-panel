@@ -30,6 +30,39 @@ def require_safe():
         raise RuntimeError('Turn heaters off before installation/rollback')
 
 
+def wait_for_host(predicate, description, timeout=45):
+    deadline=time.monotonic()+timeout
+    last='No response from Moonraker'
+    while time.monotonic()<deadline:
+        time.sleep(1)
+        try:
+            info=api('printer/info')
+        except Exception as exc:
+            last=str(exc)
+            continue
+        last=info.get('state_message') or info.get('state', 'Unknown state')
+        if predicate(info):return info
+    raise RuntimeError('%s: %s' % (description,last))
+
+
+def restart_host():
+    # RESTART/FIRMWARE_RESTART reuse the Python interpreter and imported extras.
+    # Reload the process first, then reset the MCU through the new host. Match
+    # MainPID so a cached Moonraker response cannot address the previous host.
+    subprocess.run(['systemctl','restart','klipper'],check=True)
+    result=subprocess.run(['systemctl','show','klipper','--property=MainPID','--value'],
+                          check=True,capture_output=True,text=True)
+    pid=int(result.stdout.strip())
+    if pid<=0:raise RuntimeError('Klipper service has no running process')
+    wait_for_host(lambda info:info.get('process_id')==pid and
+                  info.get('state') in ('ready','error','shutdown'),
+                  'New Klipper process did not connect')
+    api('printer/firmware_restart',True)
+    wait_for_host(lambda info:info.get('process_id')==pid and info.get('state')=='ready',
+                  'Klipper did not become ready; backup files were kept')
+    subprocess.run(['systemctl','start','fbg5-screen'],check=True)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     choice=parser.add_mutually_exclusive_group(required=True)
@@ -64,8 +97,7 @@ def main():
             else:
                 path.unlink(missing_ok=True)
         subprocess.run(['systemctl','daemon-reload'],check=True)
-        api('printer/firmware_restart',True)
-        subprocess.run(['systemctl','start','fbg5-screen'],check=True)
+        restart_host()
         print('Previous panel restored')
         return
     source=Path(__file__).resolve().parent
@@ -141,14 +173,7 @@ WantedBy=klipper.service
     subprocess.run(['systemd-analyze','verify',str(service)],check=True)
     subprocess.run(['systemctl','daemon-reload'],check=True)
     subprocess.run(['systemctl','enable','fbg5-screen'],check=True)
-    api('printer/firmware_restart',True)
-    for _ in range(30):
-        time.sleep(1)
-        try:
-            if api('printer/info')['state']=='ready':break
-        except Exception:pass
-    else:raise RuntimeError('Klipper did not become ready; use backup manifest for recovery')
-    subprocess.run(['systemctl','start','fbg5-screen'],check=True)
+    restart_host()
     print('Installed. Touch calibration is required on first start.')
 
 
