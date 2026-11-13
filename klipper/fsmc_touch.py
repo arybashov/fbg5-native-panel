@@ -16,6 +16,11 @@ class FSMCTouch:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.spi = bus.MCU_SPI_from_config(config, 0, default_speed=1000000)
+        self.shutdown_ui = config.getboolean('shutdown_ui', False)
+        self.touch_read = None
+        if self.shutdown_ui:
+            self.touch_oid = self.spi.get_mcu().create_oid()
+            self.spi.get_mcu().register_config_callback(self.build_config)
         # Other chips sharing the bus (eg, the spi flash) are deselected
         ppins = self.printer.lookup_object('pins')
         self.idle_pins = []
@@ -35,7 +40,7 @@ class FSMCTouch:
         self.mutex = self.printer.get_reactor().mutex()
         self.is_ready = False
         self.printer.register_event_handler("klippy:ready", self._ready)
-        self.printer.register_event_handler("klippy:shutdown", self._not_ready)
+        self.printer.register_event_handler("klippy:shutdown", self._shutdown)
         self.printer.register_event_handler("klippy:disconnect",
                                             self._not_ready)
         webhooks = self.printer.lookup_object('webhooks')
@@ -43,10 +48,23 @@ class FSMCTouch:
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('TOUCH_READ', self.cmd_TOUCH_READ,
                                desc=self.cmd_TOUCH_READ_help)
+    def build_config(self):
+        mcu = self.spi.get_mcu()
+        if mcu.get_constants().get('FSMC_SHUTDOWN_UI') != 1:
+            raise self.printer.config_error('Shutdown touch requires the matching FBG firmware')
+        mcu.add_config_cmd('config_fsmc_touch oid=%d spi_oid=%d'
+                           % (self.touch_oid, self.spi.get_oid()))
+        self.touch_read = mcu.lookup_query_command(
+            'fsmc_touch_read oid=%c', 'fsmc_touch_response oid=%c response=%*s',
+            oid=self.touch_oid, cq=self.spi.get_command_queue())
     def read(self):
         with self.mutex:
-            params = self.spi.spi_transfer(
-                self.request, reqclock=BACKGROUND_PRIORITY_CLOCK)
+            if self.touch_read is not None:
+                params = self.touch_read.send([self.touch_oid],
+                                              reqclock=BACKGROUND_PRIORITY_CLOCK)
+            else:
+                params = self.spi.spi_transfer(
+                    self.request, reqclock=BACKGROUND_PRIORITY_CLOCK)
         resp = bytearray(params['response'])
         vals = [((resp[i + 1] << 8) | resp[i + 2]) >> 3
                 for i in range(0, len(self.request) - 3, 3)]
@@ -63,6 +81,10 @@ class FSMCTouch:
         self.is_ready = True
     def _not_ready(self):
         self.is_ready = False
+    def _shutdown(self):
+        self.is_ready = self.is_ready and self.shutdown_ui
+    def get_status(self, eventtime):
+        return {'available': self.is_ready, 'shutdown_supported': self.shutdown_ui}
     def _handle_read(self, web_request):
         if not self.is_ready:
             raise web_request.error("fsmc_touch not ready")

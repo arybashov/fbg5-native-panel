@@ -69,6 +69,9 @@ def main():
         print('Previous panel restored')
         return
     source=Path(__file__).resolve().parent
+    constants=api('printer/objects/query?mcu')['status']['mcu'].get('mcu_constants',{})
+    if constants.get('FSMC_SHUTDOWN_UI')!=1:
+        raise SystemExit('Install the matching shutdown-UI MCU firmware before these host drivers')
     if not (base/'screen-env/bin/python').exists():raise SystemExit('Create screen-env and install requirements first')
     if not (base/'klipper/klippy/extras/fsmc_display.py').exists():raise SystemExit('Install/test FSMC display first')
     cfg_text=cfg.read_text()
@@ -77,7 +80,7 @@ def main():
     backup=base/'backups'/('native-panel-'+stamp)
     backup.mkdir(parents=True,exist_ok=False)
     destination=base/'native-panel'
-    targets=[cfg,service,destination/'panel.py',base/'klipper/klippy/extras/fsmc_touch.py',base/'printer_data/config/fbg5-panel.cfg',destination/'settings.json']
+    targets=[cfg,service,destination/'panel.py',base/'klipper/klippy/extras/fsmc_touch.py',base/'printer_data/config/fbg5-panel.cfg',destination/'settings.json',base/'klipper/klippy/extras/fsmc_display.py',base/'printer_data/config/fbg5-display.cfg']
     files={}
     for i,path in enumerate(targets):
         if path.exists():
@@ -95,10 +98,16 @@ def main():
     os.chown(destination,account.pw_uid,account.pw_gid)
     for src,dst in [(source/'panel.py',destination/'panel.py'),
                     (source/'klipper/fsmc_touch.py',targets[3]),
-                    (source/'config/fbg5-panel.cfg',targets[4])]:
+                    (source/'config/fbg5-panel.cfg',targets[4]),
+                    (source/'klipper/fsmc_display.py',targets[6])]:
         shutil.copyfile(src,dst)
         dst.chmod(0o644)
         os.chown(dst,account.pw_uid,account.pw_gid)
+    display_cfg=targets[7]
+    text=display_cfg.read_text()
+    import re
+    text=re.sub(r'^shutdown_ui:.*\n?', '', text, flags=re.M)
+    display_cfg.write_text(text.rstrip()+'\nshutdown_ui: True\n')
     cfg_text=cfg_text.replace('[include fbg5-touch.cfg]\n','')
     if '[include fbg5-panel.cfg]' not in cfg_text:
         cfg_text='[include fbg5-panel.cfg]\n'+cfg_text

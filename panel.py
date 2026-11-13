@@ -29,7 +29,7 @@ BLUE, BLUE_INK, RED, GREEN = '#9dc2ff', '#102039', '#a51f30', '#8cdcb0'
 OBJECTS = {'webhooks': None, 'extruder': ['temperature', 'target', 'can_extrude', 'power'],
            'heater_bed': ['temperature', 'target', 'power'], 'print_stats': None,
            'virtual_sdcard': ['progress', 'is_active'], 'display_status': ['progress'],
-           'pause_resume': ['is_paused']}
+           'pause_resume': ['is_paused'], 'fsmc_display': None, 'fsmc_touch': None}
 DEFAULTS = {'socket': '/opt/fbg5/printer_data/comms/klippy.sock',
             'font': '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
             'calibration': '/opt/fbg5/printer_data/config/panel-calibration.json',
@@ -117,6 +117,12 @@ def nozzle_state(values):
         return 'Отключение нагрева…', 'Ожидаю мощность 0%'
     hint = 'Сопло горячее • мощность 0%' if values.get('temperature', 0) >= 50 else 'Мощность 0%'
     return 'Нагрев выключен', hint
+
+
+def shutdown_screen(status, fresh=True):
+    return (fresh and status.get('webhooks', {}).get('state') == 'shutdown'
+            and status.get('fsmc_display', {}).get('available', False)
+            and status.get('fsmc_display', {}).get('shutdown_supported', False))
 
 
 def progress_info(status):
@@ -254,22 +260,23 @@ class Renderer:
                 buttons.append((action, rect))
         s = model['status']
         connected = model['fresh'] and s.get('webhooks', {}).get('state') == 'ready'
+        stopped = shutdown_screen(s, model['fresh'])
         text(8, 9, 'GHOST 5 / KLIPPER', 12)
-        text(312, 9, 'USB • подключён' if connected else 'Связь потеряна', 12, GREEN if connected else MUTED)
+        text(312, 9, 'USB • СТОП' if stopped else 'USB • подключён' if connected else 'Связь потеряна', 12, GREEN if connected else MUTED)
         for x, title, obj in [(8, 'СОПЛО', 'extruder'), (244, 'СТОЛ', 'heater_bed')]:
             draw.rounded_rectangle((x, 33, x+228, 89), radius=6, fill=SURFACE)
-            text(x+10, 39, title, 11, MUTED)
-            vals = s.get(obj, {})
+            text(x+10, 39, title+(' • до STOP' if stopped else ''), 11, MUTED)
+            vals = (model.get('last_ready_status', {}) if stopped else s).get(obj, {})
             power = vals.get('power')
             power_text = '%d%%' % round(100*max(0., min(1., power))) if connected and power is not None else '—'
-            text(x+122, 39, 'Мощн. '+power_text, 11, MUTED)
-            value = lambda key: str(round(vals.get(key, 0))) if connected else '—'
+            text(x+136, 39, 'Мощн. '+power_text, 11, MUTED)
+            value = lambda key: str(round(vals[key])) if key in vals and (connected or (stopped and key=='temperature')) else '—'
             text(x+10, 55, value('temperature'), 24)
             text(x+72, 63, '/ '+value('target')+' °C', 14, MUTED)
         p, remain = progress_info(s)
         names = {'printing': 'Печать', 'paused': 'Пауза', 'complete': 'Готово', 'cancelled': 'Отменено', 'error': 'Ошибка', 'standby': 'Нет печати'}
         state = s.get('print_stats', {}).get('state', 'standby')
-        text(8, 96, (names.get(state, state)+' • %d%%' % round(p*100)) if connected else 'Нет данных о печати', 12)
+        text(8, 96, 'Печать остановлена' if stopped else (names.get(state, state)+' • %d%%' % round(p*100)) if connected else 'Нет данных о печати', 12)
         if remain is None:
             eta = 'Осталось —'
         else:
@@ -279,6 +286,28 @@ class Renderer:
         draw.rounded_rectangle((8, 114, 472, 118), radius=2, fill=SURFACE)
         if p > 0 and connected:
             draw.rectangle((8, 114, 8+round(464*p), 118), fill=BLUE)
+
+        if stopped:
+            text(10, 130, 'Аварийная остановка', 20)
+            text(10, 158, 'Нагрев и движение заблокированы', 14, MUTED)
+            reason = s.get('webhooks', {}).get('state_message', '').split('\n')[0]
+            if reason == 'Shutdown due to webhooks request':
+                reason = 'Нажат СТОП'
+            words, line, lines = reason.split(), '', []
+            for word in words:
+                candidate = (line+' '+word).strip()
+                if draw.textlength(candidate, font=self.fonts[13]) > 375 and line:
+                    lines.append(line); line = word
+                else:
+                    line = candidate
+            lines.append(line)
+            for i, line in enumerate(lines[:3]):
+                text(10, 183+16*i, line, 13, FG, 376)
+            text(10, 234, model['notice'] or 'Перезапуск не возобновляет печать', 11, MUTED, 376)
+            btn(STOP, 'СТОП\nактивен', 'stop', False, danger=True, size=14)
+            recover = not model['busy'] and s.get('fsmc_touch', {}).get('available', False)
+            btn((8, 255, 392, 312), 'Перезапустить принтер', 'recover', recover, primary=True)
+            return image, buttons
 
         cal = model['calibration']
         if cal is not None:
@@ -353,6 +382,8 @@ class Panel:
             raise ValueError('Temperature/speed outside panel limits')
         self.lock = threading.RLock()
         self.status, self.status_time = {}, 0.
+        self.last_ready_status = {}
+        self.generation = 0
         self.page, self.target, self.step, self.speed = 'home', self.settings['temperature'], 5, self.settings['speed']
         self.notice, self.busy, self.operation = '', False, ''
         self.revision, self.displayed_revision, self.buttons = 0, -1, []
@@ -382,6 +413,7 @@ class Panel:
     def model(self):
         with self.lock:
             return {'status': copy.deepcopy(self.status), 'fresh': time.monotonic()-self.status_time<2,
+                    'last_ready_status': copy.deepcopy(self.last_ready_status),
                     'page': self.page, 'target': self.target, 'step': self.step, 'speed': self.speed,
                     'notice': self.notice, 'busy': self.busy,
                     'operation': self.operation, 'revision': self.revision,
@@ -396,12 +428,27 @@ class Panel:
             try:
                 status = self.read_status(rpc)
                 with self.lock:
+                    previous = self.status.get('webhooks', {}).get('state')
+                    current = status.get('webhooks', {}).get('state')
+                    if previous != current:
+                        if current != 'ready':
+                            self.generation += 1
+                            self.cancel.set()
+                        self.bump()
+                    if current == 'ready':
+                        self.last_ready_status = copy.deepcopy(status)
                     self.status, self.status_time = status, time.monotonic()
                     if self.busy and not idle(status):
                         self.cancel.set()
             except Exception as exc:
                 self.cancel.set()
+                with self.lock:
+                    if self.status_time:
+                        self.generation += 1
+                        self.status_time = 0
+                        self.bump()
                 logging.warning('Status unavailable: %s', exc)
+            self.heartbeat()
             time.sleep(.5)
 
     def render_loop(self):
@@ -410,7 +457,8 @@ class Panel:
         while True:
             try:
                 model = self.model()
-                if not model['fresh'] or model['status'].get('webhooks', {}).get('state') != 'ready':
+                if not model['fresh'] or (model['status'].get('webhooks', {}).get('state') != 'ready'
+                                         and not shutdown_screen(model['status'])):
                     old = None
                     time.sleep(.5)
                     continue
@@ -431,7 +479,6 @@ class Panel:
                         self.displayed_revision = self.revision
                         if not self.transform and not math.isfinite(self.cal_ready_at):
                             self.cal_ready_at = time.monotonic()+.25
-                self.heartbeat()
                 self.changed.wait(.5)
                 self.changed.clear()
             except Exception as exc:
@@ -451,7 +498,10 @@ class Panel:
                       'calibration_point': None if self.transform else self.cal_index+1,
                       'last_raw_touch': self.last_touch, 'touch_reads': self.read_count,
                       'touch_errors': self.read_errors, 'busy': self.busy, 'notice': self.notice,
-                      'ready': model['fresh'], 'displayed_revision': self.displayed_revision,
+                      'ready': model['fresh'] and self.status.get('webhooks',{}).get('state')=='ready',
+                      'klipper_state': self.status.get('webhooks',{}).get('state'),
+                      'shutdown_screen': shutdown_screen(self.status, model['fresh']),
+                      'displayed_revision': self.displayed_revision,
                       'revision': self.revision, 'touch_p95_ms': round(sorted(self.latencies)[int(.95*(len(self.latencies)-1))]*1000, 1) if self.latencies else None}
         atomic_json(self.settings['state_file'], report)
 
@@ -531,6 +581,7 @@ class Panel:
                 time.sleep(1)
 
     def emergency(self):
+        self.generation += 1
         self.cancel.set()
         # Never wait for ordinary command/drawing locks, completion, or confirmation.
         def send():
@@ -572,7 +623,7 @@ class Panel:
                 self.speed = {1:2, 2:5, 5:1}[self.speed]
             else:
                 try:
-                    self.commands.put_nowait((action,self.target,self.step,self.speed))
+                    self.commands.put_nowait((action,self.target,self.step,self.speed,self.generation))
                     self.busy=True
                     self.operation='Подготовка'
                     self.cancel.clear()
@@ -581,12 +632,26 @@ class Panel:
             self.bump()
 
     def execute(self, command, rpc):
-        action, target, step, speed = command
+        action, target, step, speed = command[:4]
+        generation = command[4] if len(command)>4 else self.generation
+        def guard():
+            if generation != self.generation:
+                raise ValueError('Команда отменена аварийной остановкой')
+        guard()
+        if action == 'recover':
+            status = self.read_status(rpc)
+            if not shutdown_screen(status) or not status.get('fsmc_touch',{}).get('available'):
+                raise ValueError('Перезапуск после STOP сейчас недоступен')
+            guard()
+            rpc.call('gcode/firmware_restart')
+            return 'Перезапуск запрошен'
         require_idle(self.read_status(rpc))
         required = 'FBG_PANEL_HEAT' if action in ('heat','cool') else 'FBG_PANEL_RESTART' if action in ('restart-host','restart-mcu') else 'FBG_PANEL_EXTRUDE'
         if required not in rpc.call('gcode/help'):
             raise RuntimeError('Команды панели не загружены в Klipper')
-        script = lambda code: rpc.call('gcode/script', {'script':code})
+        def script(code):
+            guard()
+            return rpc.call('gcode/script', {'script':code})
         if action in ('heat','cool'):
             desired = target if action=='heat' else 0
             script('FBG_PANEL_HEAT TEMP=%d' % desired)

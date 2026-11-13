@@ -1,0 +1,38 @@
+diff --git a/src/Kconfig b/src/Kconfig
+index 7041ee0..07d8614 100644
+--- a/src/Kconfig
++++ b/src/Kconfig
+@@ -358,3 +358,8 @@ config HAVE_LIMITED_CODE_SIZE
+     bool
+ config HAVE_SOFTWARE_DIVIDE_REQUIRED
+     bool
++
++config WANT_FSMC_LCD
++    bool "Support parallel TFT display on the FSMC bus"
++    depends on HAVE_STM32_FSMC
++    default n
+diff --git a/src/stm32/Kconfig b/src/stm32/Kconfig
+index e9aa087..efbcc47 100644
+--- a/src/stm32/Kconfig
++++ b/src/stm32/Kconfig
+@@ -558,3 +558,10 @@ config STM32_CANBUS_PH13_PH14
+     default y if STM32_MMENU_CANBUS_PH13_PH14 || STM32_CMENU_CANBUS_PH13_PH14
+ 
+ endif
++
++config HAVE_STM32_FSMC
++    bool
++    default y if MACH_STM32F103
++config STM32_FSMC_LCD_IMAGES
++    bool
++    default n
+diff --git a/src/stm32/Makefile b/src/stm32/Makefile
+index 3c158d5..6974709 100644
+--- a/src/stm32/Makefile
++++ b/src/stm32/Makefile
+@@ -109,3 +109,5 @@ flash: $(OUT)klipper.bin lib/hidflash/hid-flash
+ serialflash: $(OUT)klipper.bin
+ 	@echo "  Flashing $< to $(FLASH_DEVICE) via stm32flash"
+ 	$(Q)stm32flash -w $< -v -g 0 $(FLASH_DEVICE)
++
++src-$(CONFIG_WANT_FSMC_LCD) += stm32/fsmc_lcd.c stm32/fsmc_touch.c

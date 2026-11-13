@@ -107,6 +107,52 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(seen,['emergency_stop'])
         self.assertTrue(self.app.cancel.is_set())
 
+    def stopped_status(self):
+        s=status()
+        s['webhooks']={'state':'shutdown','state_message':'Shutdown due to webhooks request'}
+        s['fsmc_display']={'available':True,'shutdown_supported':True}
+        s['fsmc_touch']={'available':True,'shutdown_supported':True}
+        return s
+
+    def test_shutdown_screen_has_only_explicit_restart(self):
+        self.app.transform=[[1,0,0],[0,1,0]]
+        self.app.status=self.stopped_status()
+        self.app.status_time=time.monotonic()
+        self.app.last_ready_status=status(hot=True)
+        for page in ('home','more','manual','temperature'):
+            self.app.page=page
+            image,buttons=self.app.renderer.render(self.app.model())
+            self.assertEqual([a for a,r in buttons],['recover'])
+        self.app.busy=True
+        self.assertEqual(self.app.renderer.render(self.app.model())[1],[])
+
+    def test_recovery_requires_shutdown_and_explicit_action(self):
+        rpc=FakeRPC(self.stopped_status())
+        self.app.execute(('recover',200,5,2),rpc)
+        self.assertEqual([m for m,p in rpc.calls if m!='objects/query'],['gcode/firmware_restart'])
+        for s in (status(),{}, {'webhooks':{'state':'shutdown'}}):
+            rpc=FakeRPC(s)
+            with self.assertRaises(ValueError):
+                self.app.execute(('recover',200,5,2),rpc)
+            self.assertFalse(any(m=='gcode/firmware_restart' for m,p in rpc.calls))
+
+    def test_pre_stop_commands_do_not_run_after_recovery(self):
+        self.app.action('heat')
+        queued=self.app.commands.get_nowait()
+        self.app.generation+=1
+        rpc=FakeRPC(status())
+        with self.assertRaisesRegex(ValueError,'аварийной остановкой'):
+            self.app.execute(queued,rpc)
+        self.assertEqual(rpc.calls,[])
+
+    def test_shutdown_is_not_offline_or_ready(self):
+        s=self.stopped_status()
+        self.assertTrue(panel.shutdown_screen(s))
+        self.assertFalse(panel.idle(s))
+        self.assertFalse(panel.shutdown_screen(s,False))
+        s['fsmc_display']['available']=False
+        self.assertFalse(panel.shutdown_screen(s))
+
     def test_calibration_rotation_and_inversion(self):
         targets=self.app.TARGETS
         raw=[(3900-y*11,200+x*7) for x,y in targets]
