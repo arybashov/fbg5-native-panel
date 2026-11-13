@@ -1,12 +1,16 @@
 import base64
 import copy
+import configparser
+import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import panel
@@ -25,11 +29,16 @@ class FakeRPC:
         self.status=state
         self.calls=[]
         self.on_script=None
+        self.ignore_heat=False
 
     def call(self, method, params=None):
         self.calls.append((method,params))
         if method=='objects/query':
             return {'status':copy.deepcopy(self.status)}
+        if method=='gcode/help':
+            return {name:'' for name in ('FBG_PANEL_HEAT','FBG_PANEL_EXTRUDE','FBG_PANEL_RESTART')}
+        if method=='gcode/script' and params['script'].startswith('FBG_PANEL_HEAT ') and not self.ignore_heat:
+            self.status['extruder']['target']=float(params['script'].split('TEMP=')[1])
         if self.on_script:
             self.on_script(params['script'])
         return {}
@@ -64,7 +73,7 @@ class PanelTests(unittest.TestCase):
         rpc.on_script=lambda script:self.app.cancel.set()
         result=self.app.execute(('load',200,5,2),rpc)
         scripts=[p['script'] for m,p in rpc.calls if m=='gcode/script']
-        self.assertEqual(scripts,['FBG5_PANEL_EXTRUDE DIST=1.000 SPEED=2.000'])
+        self.assertEqual(scripts,['FBG_PANEL_EXTRUDE DIST=1.000 SPEED=2.000'])
         self.assertIn('отменена',result)
 
     def test_state_change_stops_following_chunk(self):
@@ -77,7 +86,7 @@ class PanelTests(unittest.TestCase):
         rpc=FakeRPC(status(hot=True))
         self.app.execute(('retract',200,5,2),rpc)
         scripts=[p['script'] for m,p in rpc.calls if m=='gcode/script']
-        self.assertEqual(scripts,['FBG5_PANEL_EXTRUDE DIST=-1.000 SPEED=2.000']*5)
+        self.assertEqual(scripts,['FBG_PANEL_EXTRUDE DIST=-1.000 SPEED=2.000']*5)
 
     def test_restart_rejects_heater_target(self):
         s=status();s['heater_bed']['target']=60
@@ -114,7 +123,7 @@ class PanelTests(unittest.TestCase):
     def test_render_keeps_stop_and_readings_on_all_pages(self):
         self.app.transform=[[1,0,0],[0,1,0]]
         self.app.status=status(hot=True);self.app.status_time=time.monotonic()
-        for page in ('home','filament','manual','restart'):
+        for page in ('home','more','manual','temperature'):
             self.app.page=page
             image,buttons=self.app.renderer.render(self.app.model())
             self.assertEqual(image.size,(480,320))
@@ -139,11 +148,38 @@ class PanelTests(unittest.TestCase):
         s['virtual_sdcard']['progress']=.001
         self.assertIsNone(panel.progress_info(s)[1])
 
-    def test_heat_and_restart_require_confirmation(self):
+    def test_heat_and_restart_queue_immediately_without_confirmation(self):
         for action in ('heat','restart-host','restart-mcu'):
+            self.app.busy=False
             self.app.action(action)
-            self.assertIsNotNone(self.app.confirm)
-            self.assertTrue(self.app.commands.empty())
+            self.assertEqual(self.app.commands.get_nowait()[0],action)
+            self.assertTrue(self.app.busy)
+
+    def test_silent_ignored_heating_is_not_reported_as_success(self):
+        rpc=FakeRPC(status())
+        rpc.ignore_heat=True
+        with self.assertRaisesRegex(RuntimeError,'не установил'):
+            self.app.execute(('heat',200,5,2),rpc)
+
+    def test_successful_heat_is_verified_by_actual_target(self):
+        rpc=FakeRPC(status())
+        self.assertEqual(self.app.execute(('heat',200,5,2),rpc),'Нагрев до 200 °C')
+        self.assertEqual(rpc.status['extruder']['target'],200)
+        self.app.execute(('cool',200,5,2),rpc)
+        self.assertEqual(rpc.status['extruder']['target'],0)
+
+    def test_home_has_four_actions_plus_stop(self):
+        self.app.transform=[[1,0,0],[0,1,0]]
+        self.app.status=status(hot=True);self.app.status_time=time.monotonic()
+        _,buttons=self.app.renderer.render(self.app.model())
+        self.assertEqual({action for action,r in buttons},{'stop','load','unload','heat','more-page'})
+
+    def test_macro_names_are_extended_commands_without_embedded_digits(self):
+        cfg=configparser.ConfigParser(interpolation=None)
+        cfg.read(Path(__file__).resolve().parents[1]/'config/fbg5-panel.cfg')
+        for section in cfg.sections():
+            if section.startswith('gcode_macro '):
+                self.assertRegex(section.split()[1],r'^[A-Z_]+$')
 
     def test_delta_encoding_restores_exact_frame(self):
         old=bytes([0,0])*480*320
@@ -163,6 +199,29 @@ class PanelTests(unittest.TestCase):
 
 def math_dist(a,b):
     return sum((x-y)**2 for x,y in zip(a,b))**.5
+
+
+@unittest.skipUnless(os.environ.get('KLIPPER_GCODE_PATH'),'Set KLIPPER_GCODE_PATH to run actual Klipper parser regression')
+class KlipperParserTests(unittest.TestCase):
+    def test_every_panel_macro_dispatches_with_parameters(self):
+        spec=importlib.util.spec_from_file_location('klipper_gcode',os.environ['KLIPPER_GCODE_PATH'])
+        mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
+        printer=SimpleNamespace(get_start_args=lambda:{},register_event_handler=lambda *a:None,
+            get_reactor=lambda:SimpleNamespace(mutex=threading.RLock),config_error=ValueError,
+            send_event=lambda *a:None)
+        gcode=mod.GCodeDispatch(printer)
+        seen=[]
+        cfg=configparser.ConfigParser(interpolation=None)
+        cfg.read(Path(__file__).resolve().parents[1]/'config/fbg5-panel.cfg')
+        for section in cfg.sections():
+            if section.startswith('gcode_macro '):
+                name=section.split()[1]
+                gcode.register_command(name,lambda cmd:seen.append((cmd.get_command(),cmd.get_command_parameters())))
+        gcode.is_printer_ready=True
+        gcode.gcode_handlers=gcode.ready_gcode_handlers
+        for name in ('FBG_PANEL_HEAT','FBG_PANEL_EXTRUDE','FBG_PANEL_RESTART'):
+            gcode.run_script(name+' TEMP=200 DIST=1 SPEED=2 MCU=1')
+            self.assertEqual(seen[-1],(name,{'TEMP':'200','DIST':'1','SPEED':'2','MCU':'1'}))
 
 
 if __name__=='__main__':unittest.main()

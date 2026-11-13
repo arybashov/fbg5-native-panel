@@ -6,3 +6,4 @@ panel-state.json
 *.log
 backups/
 local-settings.json
+.klipper-test-source/

@@ -164,7 +164,7 @@ def inside(point, rect, inset=0):
 def rgb565(image):
     # No antialiasing: fewer colours and far less UART traffic on this TFT.
     pixels = array.array('H', (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-                            for r, g, b in image.getdata()))
+                            for r, g, b in image.get_flattened_data()))
     if sys.byteorder != 'little':
         pixels.byteswap()
     return pixels.tobytes()
@@ -277,58 +277,49 @@ class Renderer:
                 text(12, 294, model['notice'], 11, MUTED, 456)
             return image, buttons
 
-        btn((400, 126, 472, 172), 'Назад' if model['page'] != 'home' else 'Домой', 'home', size=13)
+        if model['page'] != 'home' and not model['busy']:
+            btn((400, 126, 472, 172), 'Назад', 'home', size=13)
         btn(STOP, 'СТОП', 'stop', connected, danger=True, size=18)
         can = connected and idle(s) and not model['busy']
         hot = can and s.get('extruder', {}).get('can_extrude', False)
         page = model['page']
-        if model['confirm']:
-            text(12, 136, 'Подтвердите действие', 18)
-            text(12, 167, model['confirm'][1], 15, width=376)
-            text(12, 194, 'Печать должна быть остановлена', 12, MUTED)
-            btn((8, 230, 196, 287), 'Отмена', 'dismiss')
-            btn((202, 230, 392, 287), 'Подтвердить', 'confirm', can, primary=True, size=15)
-        elif model['busy']:
-            text(12, 140, 'Подача филамента', 20)
+        if model['busy']:
+            text(12, 140, 'Выполняется', 20)
             text(12, 173, model['operation'], 16, width=376)
             text(12, 203, model['notice'], 13, MUTED, 376)
             btn((8, 250, 392, 308), 'Отменить подачу', 'cancel', size=18)
         elif page == 'home':
-            title = 'Идёт печать' if state=='printing' else 'Пауза' if state=='paused' else 'Готов к работе' if connected else 'Нет подключения'
+            heating = s.get('extruder', {}).get('target', 0) > 0
+            warming = heating and abs(s.get('extruder', {}).get('temperature', 0)-s['extruder']['target']) > 5
+            title = 'Идёт печать' if state=='printing' else 'Пауза' if state=='paused' else 'Нагрев сопла…' if warming else 'Готов к работе' if connected else 'Нет подключения'
             text(10, 128, title, 18)
-            text(10, 151, Path(s.get('print_stats', {}).get('filename', '')).name or model['notice'] or 'Выберите действие', 11, MUTED, 378)
-            btn((8, 174, 196, 239), 'Загрузить', 'load-page', primary=True)
-            btn((202, 174, 392, 239), 'Выгрузить', 'unload-page')
-            btn((8, 245, 196, 312), 'Подать\nвручную', 'manual-page')
-            btn((202, 245, 392, 312), 'Перезапуск', 'restart-page')
-        elif page in ('filament', 'manual'):
-            btn((8, 126, 196, 158), 'Смена филамента', 'load-page', primary=page=='filament', size=13)
-            btn((202, 126, 392, 158), 'Ручная подача', 'manual-page', primary=page=='manual', size=13)
-            if page=='filament':
-                btn((8, 164, 50, 208), '−', 'temp-minus', can, size=22)
-                text(65, 177, '%d °C' % model['target'], 20)
-                btn((154, 164, 196, 208), '+', 'temp-plus', can, size=22)
-                btn((202, 164, 314, 208), 'Нагреть', 'heat', can, primary=True, size=14)
-                btn((320, 164, 392, 208), 'Выкл.', 'cool', can, size=14)
-                btn((8, 214, 196, 259), 'Загрузить', 'load', hot)
-                btn((202, 214, 392, 259), 'Выгрузить', 'unload', hot)
-                btn((8, 265, 196, 312), 'Продавить 5 мм', 'purge', hot, size=14)
-                message = model['notice'] or ('Идёт печать' if not can else 'Можно подавать' if hot else 'Нагрейте сопло')
-                text(204, 270, message, 12, MUTED, 184)
-                text(204, 291, 'Директ • шаги по 1 мм', 11, MUTED)
-            else:
-                for i, step in enumerate((1, 5, 10, 25)):
-                    btn((8+i*98, 164, 98+i*98, 208), '%d мм' % step, 'step:%d' % step, can, primary=model['step']==step, size=15)
-                btn((8, 214, 196, 259), '← Назад', 'retract', hot)
-                btn((202, 214, 392, 259), 'Вперёд →', 'extrude', hot)
-                btn((8, 265, 196, 312), '%g мм/с' % model['speed'], 'speed', can)
-                btn((202, 265, 392, 312), 'Температура', 'load-page', size=14)
-        elif page=='restart':
-            text(12, 129, 'Перезапуск', 18)
-            btn((8, 156, 392, 205), 'Klipper', 'restart-host', can)
-            btn((8, 211, 392, 260), 'Плата принтера', 'restart-mcu', can)
-            text(12, 275, model['notice'] or 'После СТОП восстановление — с ПК', 12, MUTED, 376)
-            text(12, 295, 'Без перезагрузки Windows', 11, MUTED)
+            hint = 'Подача доступна' if hot else 'Сначала нагрейте сопло'
+            text(10, 151, model['notice'] or Path(s.get('print_stats', {}).get('filename', '')).name or hint, 11, MUTED, 378)
+            btn((8, 174, 196, 239), 'Загрузить', 'load', hot, primary=True)
+            btn((202, 174, 392, 239), 'Выгрузить', 'unload', hot)
+            btn((8, 245, 196, 312), 'Выключить\nнагрев' if heating else 'Нагреть\n%d °C' % model['target'], 'cool' if heating else 'heat', can, primary=not heating)
+            btn((202, 245, 392, 312), 'Ещё', 'more-page')
+        elif page=='more':
+            text(12, 131, 'Дополнительно', 18)
+            text(12, 153, model['notice'], 11, MUTED, 376)
+            btn((8, 176, 196, 239), 'Подать\nвручную', 'manual-page')
+            btn((202, 176, 392, 239), 'Температура', 'temp-page')
+            restart_ok = can and not any(s.get(h,{}).get('target',0) for h in ('extruder','heater_bed'))
+            btn((8, 245, 392, 312), 'Перезапуск', 'restart-mcu', restart_ok)
+        elif page=='temperature':
+            text(12, 131, 'Температура сопла', 18)
+            text(12, 153, model['notice'] or 'Измените и нажмите «Нагреть»', 11, MUTED, 376)
+            btn((8, 174, 90, 239), '−', 'temp-minus', can, size=24)
+            text(153, 192, '%d °C' % model['target'], 24)
+            btn((310, 174, 392, 239), '+', 'temp-plus', can, size=24)
+            btn((8, 245, 392, 312), 'Нагреть до %d °C' % model['target'], 'heat', can, primary=True)
+        elif page=='manual':
+            text(12, 131, 'Ручная подача', 18)
+            text(12, 153, model['notice'] or ('Можно подавать' if hot else 'Сначала нагрейте сопло'), 11, MUTED, 376)
+            btn((8, 174, 196, 239), '← Назад', 'retract', hot)
+            btn((202, 174, 392, 239), 'Вперёд →', 'extrude', hot)
+            btn((8, 245, 196, 312), 'Шаг\n%d мм' % model['step'], 'step', can)
+            btn((202, 245, 392, 312), 'Скорость\n%g мм/с' % model['speed'], 'speed', can)
         return image, buttons
 
 
@@ -345,7 +336,7 @@ class Panel:
         self.lock = threading.RLock()
         self.status, self.status_time = {}, 0.
         self.page, self.target, self.step, self.speed = 'home', self.settings['temperature'], 5, self.settings['speed']
-        self.notice, self.confirm, self.busy, self.operation = '', None, False, ''
+        self.notice, self.busy, self.operation = '', False, ''
         self.revision, self.displayed_revision, self.buttons = 0, -1, []
         self.cancel, self.changed = threading.Event(), threading.Event()
         self.commands = queue.Queue(maxsize=1)
@@ -374,7 +365,7 @@ class Panel:
         with self.lock:
             return {'status': copy.deepcopy(self.status), 'fresh': time.monotonic()-self.status_time<2,
                     'page': self.page, 'target': self.target, 'step': self.step, 'speed': self.speed,
-                    'notice': self.notice, 'confirm': self.confirm, 'busy': self.busy,
+                    'notice': self.notice, 'busy': self.busy,
                     'operation': self.operation, 'revision': self.revision,
                     'calibration': None if self.transform else {'index': self.cal_index, 'target': self.TARGETS[self.cal_index]}}
 
@@ -546,32 +537,22 @@ class Panel:
                 return
             self.notice = ''
             if action=='home':
-                self.page, self.confirm = 'home', None
-            elif action in ('load-page','unload-page'):
-                self.page, self.confirm = 'filament', None
+                self.page = 'home'
+            elif action=='more-page':
+                self.page = 'more'
+            elif action=='temp-page':
+                self.page = 'temperature'
             elif action=='manual-page':
-                self.page, self.confirm = 'manual', None
-            elif action=='restart-page':
-                self.page, self.confirm = 'restart', None
-            elif action=='dismiss':
-                self.confirm = None
+                self.page = 'manual'
             elif action=='temp-plus':
                 self.target = min(240, self.target+5)
             elif action=='temp-minus':
                 self.target = max(170, self.target-5)
-            elif action.startswith('step:'):
-                self.step = int(action.split(':')[1])
+            elif action=='step':
+                self.step = {1:5,5:10,10:25,25:1}[self.step]
             elif action=='speed':
                 self.speed = {1:2, 2:5, 5:1}[self.speed]
-            elif action in ('restart-host','restart-mcu','heat'):
-                labels={'restart-host':'Перезапустить Klipper?', 'restart-mcu':'Сбросить плату принтера?', 'heat':'Нагреть сопло до %d °C?' % self.target}
-                self.confirm = (action, labels[action])
             else:
-                if action=='confirm':
-                    if not self.confirm:
-                        return
-                    action=self.confirm[0]
-                    self.confirm=None
                 try:
                     self.commands.put_nowait((action,self.target,self.step,self.speed))
                     self.busy=True
@@ -584,17 +565,21 @@ class Panel:
     def execute(self, command, rpc):
         action, target, step, speed = command
         require_idle(self.read_status(rpc))
+        required = 'FBG_PANEL_HEAT' if action in ('heat','cool') else 'FBG_PANEL_RESTART' if action in ('restart-host','restart-mcu') else 'FBG_PANEL_EXTRUDE'
+        if required not in rpc.call('gcode/help'):
+            raise RuntimeError('Команды панели не загружены в Klipper')
         script = lambda code: rpc.call('gcode/script', {'script':code})
-        if action=='heat':
-            script('FBG5_PANEL_HEAT TEMP=%d' % target)
-            return 'Нагрев до %d °C' % target
-        if action=='cool':
-            script('FBG5_PANEL_HEAT TEMP=0')
-            return 'Нагрев сопла выключен'
+        if action in ('heat','cool'):
+            desired = target if action=='heat' else 0
+            script('FBG_PANEL_HEAT TEMP=%d' % desired)
+            actual = self.read_status(rpc).get('extruder',{}).get('target')
+            if actual is None or abs(actual-desired)>.1:
+                raise RuntimeError('Klipper не установил температуру')
+            return 'Нагрев до %d °C' % desired if desired else 'Нагрев сопла выключен'
         if action in ('restart-host','restart-mcu'):
             require_idle(self.read_status(rpc), cold=True)
             # Macro rechecks print/heater state in the same G-code execution slot.
-            script('FBG5_PANEL_RESTART MCU=%d' % (action=='restart-mcu'))
+            script('FBG_PANEL_RESTART MCU=%d' % (action=='restart-mcu'))
             return 'Перезапуск запрошен'
         amounts={'load':self.settings['load_mm'], 'unload':-self.settings['unload_mm'],
                  'purge':self.settings['purge_mm'], 'extrude':step, 'retract':-step}
@@ -610,7 +595,7 @@ class Panel:
                 self.operation='%s %g / %g мм' % ('Подача' if distance>0 else 'Отвод', abs(done), abs(distance))
                 self.changed.set()
             # The macro enforces idle/hot/range limits again at execution time.
-            script('FBG5_PANEL_EXTRUDE DIST=%.3f SPEED=%.3f' % (amount,speed))
+            script('FBG_PANEL_EXTRUDE DIST=%.3f SPEED=%.3f' % (amount,speed))
             done+=amount
         return 'Подача отменена' if self.cancel.is_set() else 'Готово: %g мм' % abs(done)
 
@@ -626,7 +611,7 @@ class Panel:
                 if command[0] in ('load','unload','purge','extrude','retract'):
                     try:
                         if self.read_status(rpc).get('webhooks',{}).get('state')=='ready':
-                            rpc.call('gcode/script', {'script':'RESTORE_GCODE_STATE NAME=FBG5_PANEL MOVE=0'})
+                            rpc.call('gcode/script', {'script':'RESTORE_GCODE_STATE NAME=FBG_PANEL MOVE=0'})
                     except Exception:
                         pass
                 self.notice=str(exc)
