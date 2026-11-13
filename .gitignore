@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+panel-calibration.json
+panel-state.json
+*.log
+backups/
+local-settings.json
