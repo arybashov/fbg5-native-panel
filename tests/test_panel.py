@@ -20,8 +20,8 @@ def status(state='standby', hot=False):
     return {'webhooks':{'state':'ready'}, 'print_stats':{'state':state},
             'virtual_sdcard':{'is_active':state=='printing','progress':.36},
             'pause_resume':{'is_paused':state=='paused'},
-            'extruder':{'can_extrude':hot,'temperature':200 if hot else 25,'target':0},
-            'heater_bed':{'temperature':25,'target':0}}
+            'extruder':{'can_extrude':hot,'temperature':200 if hot else 25,'target':0,'power':0},
+            'heater_bed':{'temperature':25,'target':0,'power':0}}
 
 
 class FakeRPC:
@@ -167,6 +167,37 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(rpc.status['extruder']['target'],200)
         self.app.execute(('cool',200,5,2),rpc)
         self.assertEqual(rpc.status['extruder']['target'],0)
+
+    def test_cool_waits_for_zero_power_after_target_is_cleared(self):
+        rpc=FakeRPC(status(hot=True))
+        rpc.status['extruder'].update(target=200,power=1)
+        with patch.object(panel.time,'sleep',side_effect=lambda _:rpc.status['extruder'].update(power=0)) as wait:
+            self.assertEqual(self.app.execute(('cool',200,5,2),rpc),'Нагрев сопла выключен')
+        wait.assert_called_once_with(.1)
+
+    def test_cool_does_not_accept_power_on_or_missing_as_disabled(self):
+        for power in (1,None):
+            rpc=FakeRPC(status(hot=True))
+            rpc.status['extruder']['power']=power
+            with patch.object(panel.time,'monotonic',side_effect=[0,3]):
+                with self.assertRaisesRegex(RuntimeError,'Выключение не подтверждено'):
+                    self.app.execute(('cool',200,5,2),rpc)
+
+    def test_cool_does_not_accept_zeroes_from_error_state(self):
+        rpc=FakeRPC(status())
+        rpc.on_script=lambda _:rpc.status['webhooks'].update(state='error')
+        with self.assertRaisesRegex(RuntimeError,'результат команды не подтверждён'):
+            self.app.execute(('cool',200,5,2),rpc)
+
+    def test_heater_state_distinguishes_hot_but_off_from_active_target(self):
+        self.assertEqual(panel.nozzle_state({'target':0,'power':0,'temperature':82}),
+                         ('Нагрев выключен','Сопло горячее • мощность 0%'))
+        self.assertEqual(panel.nozzle_state({'target':0,'power':1,'temperature':82})[0],
+                         'Отключение нагрева…')
+        self.assertEqual(panel.nozzle_state({'target':200,'power':0,'temperature':200})[0],
+                         'Температура достигнута')
+        self.assertEqual(panel.nozzle_state({'target':0,'power':0,'temperature':30})[1],'Мощность 0%')
+        self.assertEqual(panel.nozzle_state({'target':0})[0],'Нет данных о нагреве')
 
     def test_home_has_four_actions_plus_stop(self):
         self.app.transform=[[1,0,0],[0,1,0]]

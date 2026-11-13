@@ -105,6 +105,20 @@ def require_idle(status, hot=False, cold=False):
         raise ValueError('Сначала выключите нагрев')
 
 
+def nozzle_state(values):
+    """Describe control state, not a cooling trend or measured electrical power."""
+    target, power = values.get('target'), values.get('power')
+    if target is None or power is None:
+        return 'Нет данных о нагреве', ''
+    if target > 0:
+        warming = abs(values.get('temperature', 0)-target) > 5
+        return ('Нагрев сопла…' if warming else 'Температура достигнута'), ''
+    if power > 0:
+        return 'Отключение нагрева…', 'Ожидаю мощность 0%'
+    hint = 'Сопло горячее • мощность 0%' if values.get('temperature', 0) >= 50 else 'Мощность 0%'
+    return 'Нагрев выключен', hint
+
+
 def progress_info(status):
     stats = status.get('print_stats', {})
     state = stats.get('state', 'standby')
@@ -246,6 +260,9 @@ class Renderer:
             draw.rounded_rectangle((x, 33, x+228, 89), radius=6, fill=SURFACE)
             text(x+10, 39, title, 11, MUTED)
             vals = s.get(obj, {})
+            power = vals.get('power')
+            power_text = '%d%%' % round(100*max(0., min(1., power))) if connected and power is not None else '—'
+            text(x+122, 39, 'Мощн. '+power_text, 11, MUTED)
             value = lambda key: str(round(vals.get(key, 0))) if connected else '—'
             text(x+10, 55, value('temperature'), 24)
             text(x+72, 63, '/ '+value('target')+' °C', 14, MUTED)
@@ -290,11 +307,12 @@ class Renderer:
             btn((8, 250, 392, 308), 'Отменить подачу', 'cancel', size=18)
         elif page == 'home':
             heating = s.get('extruder', {}).get('target', 0) > 0
-            warming = heating and abs(s.get('extruder', {}).get('temperature', 0)-s['extruder']['target']) > 5
-            title = 'Идёт печать' if state=='printing' else 'Пауза' if state=='paused' else 'Нагрев сопла…' if warming else 'Готов к работе' if connected else 'Нет подключения'
+            heater_title, heater_hint = nozzle_state(s.get('extruder', {}))
+            title = 'Идёт печать' if state=='printing' else 'Пауза' if state=='paused' else heater_title if connected else 'Нет подключения'
             text(10, 128, title, 18)
-            hint = 'Подача доступна' if hot else 'Сначала нагрейте сопло'
-            text(10, 151, model['notice'] or Path(s.get('print_stats', {}).get('filename', '')).name or hint, 11, MUTED, 378)
+            hint = heater_hint or ('Подача доступна' if hot else 'Сначала нагрейте сопло')
+            notice = '' if model['notice'] == 'Нагрев сопла выключен' else model['notice']
+            text(10, 151, notice or Path(s.get('print_stats', {}).get('filename', '')).name or hint, 11, MUTED, 378)
             btn((8, 174, 196, 239), 'Загрузить', 'load', hot, primary=True)
             btn((202, 174, 392, 239), 'Выгрузить', 'unload', hot)
             btn((8, 245, 196, 312), 'Выключить\nнагрев' if heating else 'Нагреть\n%d °C' % model['target'], 'cool' if heating else 'heat', can, primary=not heating)
@@ -572,9 +590,23 @@ class Panel:
         if action in ('heat','cool'):
             desired = target if action=='heat' else 0
             script('FBG_PANEL_HEAT TEMP=%d' % desired)
-            actual = self.read_status(rpc).get('extruder',{}).get('target')
-            if actual is None or abs(actual-desired)>.1:
-                raise RuntimeError('Klipper не установил температуру')
+            deadline = time.monotonic()+2
+            while True:
+                status = self.read_status(rpc)
+                if status.get('webhooks', {}).get('state') != 'ready':
+                    raise RuntimeError('Нет связи: результат команды не подтверждён')
+                heater = status.get('extruder', {})
+                actual = heater.get('target')
+                if actual is None or not math.isfinite(actual) or abs(actual-desired)>.1:
+                    raise RuntimeError('Klipper не установил температуру')
+                # Target=0 alone does not establish that PWM has been disabled.
+                if desired or heater.get('power') == 0:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Выключение не подтверждено — нажмите СТОП')
+                time.sleep(.1)
+            logging.info('Nozzle control confirmed: target=%s power=%s temperature=%s',
+                         actual, heater.get('power'), heater.get('temperature'))
             return 'Нагрев до %d °C' % desired if desired else 'Нагрев сопла выключен'
         if action in ('restart-host','restart-mcu'):
             require_idle(self.read_status(rpc), cold=True)
@@ -640,7 +672,7 @@ def main():
     if args.preview:
         panel.transform=[[1,0,0],[0,1,0]]
         panel.status={'webhooks':{'state':'ready'}, 'print_stats':{'state':'printing','filename':'vase-ribbed.gcode','print_duration':2800},
-                      'virtual_sdcard':{'progress':.36}, 'extruder':{'temperature':210,'target':210},'heater_bed':{'temperature':60,'target':60}}
+                      'virtual_sdcard':{'progress':.36}, 'extruder':{'temperature':210,'target':210,'power':.42},'heater_bed':{'temperature':60,'target':60,'power':.27}}
         panel.status_time=time.monotonic()
         panel.renderer.render(panel.model())[0].save(args.preview)
     elif args.probe:
